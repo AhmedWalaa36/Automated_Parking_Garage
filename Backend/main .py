@@ -62,18 +62,15 @@ class StartParkingBody(BaseModel):
 class RetrieveCarBody(BaseModel):
     vehicle_id: int
 
-class LegacyRetrieveBody(BaseModel):
-    plate_no: str
+
 
 # ESP32 hardware schemas
 class HardwareParkedBody(BaseModel):
     plate_no: str
     spot_code: str
-    cmd_id: int
 
 class HardwareRetrievedBody(BaseModel):
     spot_code: str
-    cmd_id: int
 
 class AdminAddCustomerBody(BaseModel):
     name: str
@@ -98,7 +95,7 @@ def init_db():
     try:
         conn.execute("BEGIN IMMEDIATE;")
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS Customer (
+            CREATE TABLE IF NOT EXISTS Customers (
                 CustomerID INTEGER PRIMARY KEY AUTOINCREMENT,
                 Name TEXT NOT NULL,
                 Phone TEXT,
@@ -108,47 +105,57 @@ def init_db():
             );
         """)
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS Vehicle (
+            CREATE TABLE IF NOT EXISTS Vehicles (
                 VehicleID INTEGER PRIMARY KEY AUTOINCREMENT,
                 CustomerID INTEGER NOT NULL,
                 PlateNo TEXT UNIQUE NOT NULL,
-                FOREIGN KEY (CustomerID) REFERENCES Customer(CustomerID) ON DELETE CASCADE
+                FOREIGN KEY (CustomerID) REFERENCES Customers(CustomerID) ON DELETE CASCADE
             );
         """)
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS ParkingSpot (
+            CREATE TABLE IF NOT EXISTS ParkingSpots (
                 SpotID INTEGER PRIMARY KEY AUTOINCREMENT,
                 SpotCode TEXT UNIQUE NOT NULL,
                 Status TEXT DEFAULT 'Free'
             );
         """)
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS ParkingSession (
+            CREATE TABLE IF NOT EXISTS ParkingSessions (
                 SessionID INTEGER PRIMARY KEY AUTOINCREMENT,
                 VehicleID INTEGER NOT NULL,
                 SpotID INTEGER NOT NULL,
                 EntryTime TEXT NOT NULL,
                 ExitTime TEXT,
                 Fee REAL,
-                FOREIGN KEY (VehicleID) REFERENCES Vehicle(VehicleID) ON DELETE CASCADE,
-                FOREIGN KEY (SpotID) REFERENCES ParkingSpot(SpotID) ON DELETE CASCADE
+                FOREIGN KEY (VehicleID) REFERENCES Vehicles(VehicleID) ON DELETE CASCADE,
+                FOREIGN KEY (SpotID) REFERENCES ParkingSpots(SpotID) ON DELETE CASCADE
             );
         """)
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS command_queue (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                command    TEXT NOT NULL,
-                plate_no   TEXT,
-                spot_code  TEXT,
-                status     TEXT DEFAULT 'pending',
-                created_at TEXT NOT NULL
+            CREATE TABLE IF NOT EXISTS Payments (
+                PaymentID     INTEGER PRIMARY KEY AUTOINCREMENT,
+                SessionID     INTEGER NOT NULL,
+                Amount        REAL NOT NULL,
+                PaymentMethod TEXT DEFAULT 'Cash',
+                PaymentTime   TEXT NOT NULL,
+                FOREIGN KEY (SessionID) REFERENCES ParkingSessions(SessionID) ON DELETE CASCADE
+            );
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS Logs (
+                LogID     INTEGER PRIMARY KEY AUTOINCREMENT,
+                Event     TEXT NOT NULL,
+                EventType TEXT DEFAULT 'INFO',
+                Source    TEXT,
+                Time      TEXT NOT NULL
             );
         """)
 
-        spots_count = conn.execute("SELECT COUNT(*) as cnt FROM ParkingSpot").fetchone()["cnt"]
+
+        spots_count = conn.execute("SELECT COUNT(*) as cnt FROM ParkingSpots").fetchone()["cnt"]
         if spots_count == 0:
             for i in range(1, 13):
-                conn.execute("INSERT INTO ParkingSpot (SpotCode, Status) VALUES (?, 'Free')", (f"PL.{i}",))
+                conn.execute("INSERT INTO ParkingSpots (SpotCode, Status) VALUES (?, 'Free')", (f"PL.{i}",))
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -205,7 +212,7 @@ async def car_entry(request: Request):
     try:
         conn.execute("BEGIN IMMEDIATE;")
         vehicle = conn.execute(
-            "SELECT v.*, c.Name FROM Vehicle v JOIN Customer c ON v.CustomerID = c.CustomerID WHERE v.PlateNo=?",
+            "SELECT v.*, c.Name FROM Vehicles v JOIN Customers c ON v.CustomerID = c.CustomerID WHERE v.PlateNo=?",
             (plate,)
         ).fetchone()
 
@@ -214,7 +221,7 @@ async def car_entry(request: Request):
             raise HTTPException(404, f"Plate {plate} is not registered")
 
         already_parked = conn.execute(
-            "SELECT SessionID FROM ParkingSession WHERE VehicleID=? AND ExitTime IS NULL",
+            "SELECT SessionID FROM ParkingSessions WHERE VehicleID=? AND ExitTime IS NULL",
             (vehicle["VehicleID"],)
         ).fetchone()
 
@@ -222,19 +229,13 @@ async def car_entry(request: Request):
             logger.warning(f"Vehicle with Plate {plate} is already actively parked.")
             raise HTTPException(409, "This vehicle already has an active session")
 
-        duplicate = conn.execute(
-            "SELECT id FROM command_queue WHERE command='park' AND plate_no=? AND status='pending'",
-            (plate,)
-        ).fetchone()
-
-        if not duplicate:
-            conn.execute(
-                "INSERT INTO command_queue (command, plate_no, status, created_at) VALUES (?,?,?,?)",
-                ("park", plate, "pending", datetime.now().isoformat())
-            )
-
         conn.commit()
         logger.info(f"Entry processed successfully for Plate: {plate}, Customer: {vehicle['Name']}")
+        conn.execute(
+            "INSERT INTO Logs (Event, EventType, Source, Time) VALUES (?,?,?,?)"
+            , (f"Vehicle entry detected, Plate={plate}, Customer={vehicle['Name']}", "INFO", "CAMERA", datetime.now().isoformat())
+        )
+        conn.commit()
         return {"status": "ok", "plate": plate, "customer": vehicle["Name"]}
     except HTTPException:
         raise
@@ -246,36 +247,19 @@ async def car_entry(request: Request):
         conn.close()
 
 
-@app.get("/command")
-def get_command():
-    conn = db()
-    try:
-        cmd = conn.execute(
-            "SELECT * FROM command_queue WHERE status='pending' ORDER BY id LIMIT 1"
-        ).fetchone()
-        if not cmd:
-            return {"command": "none"}
-        return {
-            "command":   cmd["command"],
-            "cmd_id":    cmd["id"],
-            "plate_no":  cmd["plate_no"],
-            "spot_code": cmd["spot_code"]
-        }
-    finally:
-        conn.close()
+
 
 
 @app.post("/parked")
 def car_parked(body: HardwareParkedBody):
     plate     = body.plate_no.upper()
     spot_code = body.spot_code
-    cmd_id    = body.cmd_id
 
     conn = db()
     try:
         conn.execute("BEGIN IMMEDIATE;")
-        vehicle = conn.execute("SELECT VehicleID FROM Vehicle WHERE PlateNo=?", (plate,)).fetchone()
-        spot = conn.execute("SELECT SpotID, Status FROM ParkingSpot WHERE SpotCode=?", (spot_code,)).fetchone()
+        vehicle = conn.execute("SELECT VehicleID FROM Vehicles WHERE PlateNo=?", (plate,)).fetchone()
+        spot = conn.execute("SELECT SpotID, Status FROM ParkingSpots WHERE SpotCode=?", (spot_code,)).fetchone()
 
         if not vehicle or not spot:
             raise HTTPException(404, "Vehicle or Spot matching hardware data not found")
@@ -284,7 +268,7 @@ def car_parked(body: HardwareParkedBody):
             raise HTTPException(409, "Target parking spot is already occupied")
 
         already_parked = conn.execute(
-            "SELECT SessionID FROM ParkingSession WHERE VehicleID=? AND ExitTime IS NULL",
+            "SELECT SessionID FROM ParkingSessions WHERE VehicleID=? AND ExitTime IS NULL",
             (vehicle["VehicleID"],)
         ).fetchone()
 
@@ -292,11 +276,10 @@ def car_parked(body: HardwareParkedBody):
             raise HTTPException(409, "Vehicle already parked in another session")
 
         conn.execute(
-            "INSERT INTO ParkingSession (VehicleID, SpotID, EntryTime) VALUES (?,?,?)",
+            "INSERT INTO ParkingSessions (VehicleID, SpotID, EntryTime) VALUES (?,?,?)",
             (vehicle["VehicleID"], spot["SpotID"], datetime.now().isoformat())
         )
-        conn.execute("UPDATE ParkingSpot SET Status='Occupied' WHERE SpotID=?", (spot["SpotID"],))
-        conn.execute("UPDATE command_queue SET status='done' WHERE id=?", (cmd_id,))
+        conn.execute("UPDATE ParkingSpots SET Status='Occupied' WHERE SpotID=?", (spot["SpotID"],))
         conn.commit()
         logger.info(f"Parking complete: Plate {plate} successfully parked at Spot {spot_code}")
         return {"status": "ok"}
@@ -313,32 +296,28 @@ def car_parked(body: HardwareParkedBody):
 @app.post("/retrieved")
 def car_retrieved(body: HardwareRetrievedBody):
     spot_code = body.spot_code
-    cmd_id    = body.cmd_id
 
     conn = db()
     try:
         conn.execute("BEGIN IMMEDIATE;")
         session = conn.execute(
-            """SELECT ps.* FROM ParkingSession ps
-               JOIN ParkingSpot p ON ps.SpotID = p.SpotID
+            """SELECT ps.* FROM ParkingSessions ps
+               JOIN ParkingSpots p ON ps.SpotID = p.SpotID
                WHERE p.SpotCode=? AND ps.ExitTime IS NULL""",
             (spot_code,)
         ).fetchone()
 
         if not session:
-            # Session may have already been closed by /retrieve_car — that's fine
-            conn.execute("UPDATE command_queue SET status='done' WHERE id=?", (cmd_id,))
             conn.commit()
             return {"status": "ok", "note": "session already closed"}
 
         minutes, fee = calc_fee(session["EntryTime"])
 
         conn.execute(
-            "UPDATE ParkingSession SET ExitTime=?, Fee=? WHERE SessionID=?",
+            "UPDATE ParkingSessions SET ExitTime=?, Fee=? WHERE SessionID=?",
             (datetime.now().isoformat(), fee, session["SessionID"])
         )
-        conn.execute("UPDATE ParkingSpot SET Status='Free' WHERE SpotID=?", (session["SpotID"],))
-        conn.execute("UPDATE command_queue SET status='done' WHERE id=?", (cmd_id,))
+        conn.execute("UPDATE ParkingSpots SET Status='Free' WHERE SpotID=?", (session["SpotID"],))
         conn.commit()
         logger.info(f"Retrieval complete: Vehicle from Spot {spot_code} retrieved successfully.")
         return {"status": "ok", "fee": fee, "duration_min": minutes}
@@ -368,7 +347,7 @@ def login(body: LoginBody):
     conn = db()
     try:
         customer = conn.execute(
-            "SELECT * FROM Customer WHERE Email=? AND Password=?", (email, password)
+            "SELECT * FROM Customers WHERE Email=? AND Password=?", (email, password)
         ).fetchone()
 
         if not customer:
@@ -397,7 +376,7 @@ def register(body: RegisterBody):
     try:
         conn.execute("BEGIN IMMEDIATE;")
         cursor = conn.execute(
-            "INSERT INTO Customer (Name, Phone, Email, Password, Membership) VALUES (?,?,?,?,?)",
+            "INSERT INTO Customers (Name, Phone, Email, Password, Membership) VALUES (?,?,?,?,?)",
             (body.Name, body.Phone, body.Email, body.Password, body.Membership)
         )
         customer_id = cursor.lastrowid
@@ -423,7 +402,7 @@ def add_vehicle(body: AddVehicleBody):
     try:
         conn.execute("BEGIN IMMEDIATE;")
         cursor = conn.execute(
-            "INSERT INTO Vehicle (CustomerID, PlateNo) VALUES (?,?)",
+            "INSERT INTO Vehicles (CustomerID, PlateNo) VALUES (?,?)",
             (body.CustomerID, body.PlateNo.upper())
         )
         vehicle_id = cursor.lastrowid
@@ -447,7 +426,7 @@ def get_customer(id: int):
     """
     conn = db()
     try:
-        customer = conn.execute("SELECT * FROM Customer WHERE CustomerID=?", (id,)).fetchone()
+        customer = conn.execute("SELECT * FROM Customers WHERE CustomerID=?", (id,)).fetchone()
         if not customer:
             raise HTTPException(404, "Customer not found")
         return {
@@ -471,7 +450,7 @@ def update_customer(id: int, body: UpdateCustomerBody):
     conn = db()
     try:
         conn.execute("BEGIN IMMEDIATE;")
-        customer = conn.execute("SELECT * FROM Customer WHERE CustomerID=?", (id,)).fetchone()
+        customer = conn.execute("SELECT * FROM Customers WHERE CustomerID=?", (id,)).fetchone()
         if not customer:
             raise HTTPException(404, "Customer not found")
 
@@ -482,7 +461,7 @@ def update_customer(id: int, body: UpdateCustomerBody):
         membership = body.Membership if body.Membership is not None else customer["Membership"]
 
         conn.execute(
-            "UPDATE Customer SET Name=?, Phone=?, Email=?, Password=?, Membership=? WHERE CustomerID=?",
+            "UPDATE Customers SET Name=?, Phone=?, Email=?, Password=?, Membership=? WHERE CustomerID=?",
             (name, phone, email, password, membership, id)
         )
         conn.commit()
@@ -502,10 +481,10 @@ def delete_customer_endpoint(id: int):
     conn = db()
     try:
         conn.execute("BEGIN IMMEDIATE;")
-        customer = conn.execute("SELECT * FROM Customer WHERE CustomerID=?", (id,)).fetchone()
+        customer = conn.execute("SELECT * FROM Customers WHERE CustomerID=?", (id,)).fetchone()
         if not customer:
             raise HTTPException(404, "Customer not found")
-        conn.execute("DELETE FROM Customer WHERE CustomerID=?", (id,))
+        conn.execute("DELETE FROM Customers WHERE CustomerID=?", (id,))
         conn.commit()
         return {"status": "ok"}
     except Exception as e:
@@ -523,7 +502,7 @@ def get_customer_vehicles(id: int):
     """
     conn = db()
     try:
-        vehicles = conn.execute("SELECT * FROM Vehicle WHERE CustomerID=?", (id,)).fetchall()
+        vehicles = conn.execute("SELECT * FROM Vehicles WHERE CustomerID=?", (id,)).fetchall()
         return [
             {
                 "VehicleID":  v["VehicleID"],
@@ -549,9 +528,9 @@ def get_customer_sessions(id: int):
         sessions = conn.execute(
             """SELECT ps.SessionID, ps.VehicleID, ps.SpotID, ps.EntryTime, ps.ExitTime, ps.Fee,
                       v.PlateNo, spot.SpotCode
-               FROM ParkingSession ps
-               JOIN Vehicle v    ON ps.VehicleID = v.VehicleID
-               JOIN ParkingSpot spot ON ps.SpotID = spot.SpotID
+               FROM ParkingSessions ps
+               JOIN Vehicles v    ON ps.VehicleID = v.VehicleID
+               JOIN ParkingSpots spot ON ps.SpotID = spot.SpotID
                WHERE v.CustomerID=?
                ORDER BY ps.EntryTime DESC""",
             (id,)
@@ -581,7 +560,7 @@ def get_available_spots():
     """
     conn = db()
     try:
-        spots = conn.execute("SELECT * FROM ParkingSpot WHERE Status='Free'").fetchall()
+        spots = conn.execute("SELECT * FROM ParkingSpots WHERE Status='Free'").fetchall()
         return [
             {
                 "SpotID":   s["SpotID"],
@@ -607,23 +586,23 @@ def start_parking(body: StartParkingBody):
     try:
         conn.execute("BEGIN IMMEDIATE;")
         spot = conn.execute(
-            "SELECT * FROM ParkingSpot WHERE SpotID=? AND Status='Free'", (spot_id,)
+            "SELECT * FROM ParkingSpots WHERE SpotID=? AND Status='Free'", (spot_id,)
         ).fetchone()
         if not spot:
             raise HTTPException(400, "Spot is busy or does not exist")
 
         already_parked = conn.execute(
-            "SELECT SessionID FROM ParkingSession WHERE VehicleID=? AND ExitTime IS NULL", (vehicle_id,)
+            "SELECT SessionID FROM ParkingSessions WHERE VehicleID=? AND ExitTime IS NULL", (vehicle_id,)
         ).fetchone()
         if already_parked:
             raise HTTPException(409, "Vehicle already parked in another session")
 
         cursor = conn.execute(
-            "INSERT INTO ParkingSession (VehicleID, SpotID, EntryTime) VALUES (?,?,?)",
+            "INSERT INTO ParkingSessions (VehicleID, SpotID, EntryTime) VALUES (?,?,?)",
             (vehicle_id, spot_id, datetime.now().isoformat())
         )
         session_id = cursor.lastrowid
-        conn.execute("UPDATE ParkingSpot SET Status='Occupied' WHERE SpotID=?", (spot_id,))
+        conn.execute("UPDATE ParkingSpots SET Status='Occupied' WHERE SpotID=?", (spot_id,))
         conn.commit()
         return {"SessionID": session_id}
     except HTTPException:
@@ -658,9 +637,9 @@ def request_retrieve_car(body: RetrieveCarBody):
         session = conn.execute(
             """SELECT ps.SessionID, ps.VehicleID, ps.SpotID, ps.EntryTime,
                       s.SpotCode, v.PlateNo
-               FROM ParkingSession ps
-               JOIN ParkingSpot s ON ps.SpotID = s.SpotID
-               JOIN Vehicle v     ON ps.VehicleID = v.VehicleID
+               FROM ParkingSessions ps
+               JOIN ParkingSpots s ON ps.SpotID = s.SpotID
+               JOIN Vehicles v     ON ps.VehicleID = v.VehicleID
                WHERE ps.VehicleID=? AND ps.ExitTime IS NULL""",
             (vehicle_id,)
         ).fetchone()
@@ -674,25 +653,13 @@ def request_retrieve_car(body: RetrieveCarBody):
 
         # Close the session immediately so Flutter can show payment
         conn.execute(
-            "UPDATE ParkingSession SET ExitTime=?, Fee=? WHERE SessionID=?",
+            "UPDATE ParkingSessions SET ExitTime=?, Fee=? WHERE SessionID=?",
             (exit_time, fee, session["SessionID"])
         )
         conn.execute(
-            "UPDATE ParkingSpot SET Status='Free' WHERE SpotID=?",
+            "UPDATE ParkingSpots SET Status='Free' WHERE SpotID=?",
             (session["SpotID"],)
         )
-
-        # Queue hardware command for ESP32 (if not already queued)
-        duplicate = conn.execute(
-            "SELECT id FROM command_queue WHERE command='retrieve' AND spot_code=? AND status='pending'",
-            (session["SpotCode"],)
-        ).fetchone()
-
-        if not duplicate:
-            conn.execute(
-                "INSERT INTO command_queue (command, spot_code, status, created_at) VALUES (?,?,?,?)",
-                ("retrieve", session["SpotCode"], "pending", datetime.now().isoformat())
-            )
 
         conn.commit()
         logger.info(f"Retrieve complete for VehicleID {vehicle_id}, Spot {session['SpotCode']}, Fee: {fee} EGP")
@@ -719,46 +686,7 @@ def request_retrieve_car(body: RetrieveCarBody):
         conn.close()
 
 
-@app.post("/retrieve")
-def request_retrieve_legacy(body: LegacyRetrieveBody):
-    """Legacy endpoint — queues by plate number, does NOT close the session."""
-    plate = body.plate_no.upper()
-    logger.info(f"Legacy retrieve requested for Plate: {plate}")
-    conn = db()
-    try:
-        conn.execute("BEGIN IMMEDIATE;")
-        session = conn.execute(
-            """SELECT ps.*, s.SpotCode FROM ParkingSession ps
-               JOIN Vehicle v ON ps.VehicleID = v.VehicleID
-               JOIN ParkingSpot s ON ps.SpotID = s.SpotID
-               WHERE v.PlateNo=? AND ps.ExitTime IS NULL""",
-            (plate,)
-        ).fetchone()
 
-        if not session:
-            raise HTTPException(404, "No active session for this vehicle")
-
-        duplicate = conn.execute(
-            "SELECT id FROM command_queue WHERE command='retrieve' AND spot_code=? AND status='pending'",
-            (session["SpotCode"],)
-        ).fetchone()
-
-        if duplicate:
-            return {"status": "already_queued"}
-
-        conn.execute(
-            "INSERT INTO command_queue (command, spot_code, status, created_at) VALUES (?,?,?,?)",
-            ("retrieve", session["SpotCode"], "pending", datetime.now().isoformat())
-        )
-        conn.commit()
-        return {"status": "ok"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(500, str(e))
-    finally:
-        conn.close()
 
 
 @app.get("/vehicle/{id}/current_status")
@@ -770,8 +698,8 @@ def get_vehicle_status(id: int):
     conn = db()
     try:
         session = conn.execute(
-            """SELECT ps.*, s.SpotCode FROM ParkingSession ps
-               JOIN ParkingSpot s ON ps.SpotID = s.SpotID
+            """SELECT ps.*, s.SpotCode FROM ParkingSessions ps
+               JOIN ParkingSpots s ON ps.SpotID = s.SpotID
                WHERE ps.VehicleID=? AND ps.ExitTime IS NULL""",
             (id,)
         ).fetchone()
@@ -800,7 +728,7 @@ def latest_open_session(id: int):
     conn = db()
     try:
         session = conn.execute(
-            "SELECT * FROM ParkingSession WHERE VehicleID=? AND ExitTime IS NULL ORDER BY SessionID DESC LIMIT 1",
+            "SELECT * FROM ParkingSessions WHERE VehicleID=? AND ExitTime IS NULL ORDER BY SessionID DESC LIMIT 1",
             (id,)
         ).fetchone()
         if not session:
@@ -822,10 +750,10 @@ def get_session(plate_no: str):
     conn = db()
     try:
         session = conn.execute(
-            """SELECT ps.*, v.PlateNo, c.Name as CustomerName, s.SpotCode FROM ParkingSession ps
-               JOIN Vehicle v ON ps.VehicleID = v.VehicleID
-               JOIN Customer c ON v.CustomerID = c.CustomerID
-               JOIN ParkingSpot s ON ps.SpotID = s.SpotID
+            """SELECT ps.*, v.PlateNo, c.Name as CustomerName, s.SpotCode FROM ParkingSessions ps
+               JOIN Vehicles v ON ps.VehicleID = v.VehicleID
+               JOIN Customers c ON v.CustomerID = c.CustomerID
+               JOIN ParkingSpots s ON ps.SpotID = s.SpotID
                WHERE v.PlateNo=? AND ps.ExitTime IS NULL""",
             (plate_no.upper(),)
         ).fetchone()
@@ -864,9 +792,9 @@ def admin_data():
             """SELECT ps.SessionID as id, v.PlateNo as plate_no, c.Name as customer_name,
                       spot.SpotCode as spot_code, ps.EntryTime as entry_time, ps.ExitTime as exit_time,
                       ps.Fee as fee, CASE WHEN ps.ExitTime IS NULL THEN 'active' ELSE 'completed' END as status
-               FROM ParkingSession ps
-               JOIN Vehicle v ON ps.VehicleID = v.VehicleID
-               JOIN Customer c ON v.CustomerID = c.CustomerID
+               FROM ParkingSessions ps
+               JOIN Vehicles v ON ps.VehicleID = v.VehicleID
+               JOIN Customers c ON v.CustomerID = c.CustomerID
                ORDER BY ps.EntryTime DESC LIMIT 50"""
         ).fetchall()
 
@@ -884,16 +812,13 @@ def admin_data():
 
         raw_customers = conn.execute(
             """SELECT c.Name as name, v.PlateNo as plate_no, c.Phone as phone, c.Password as pin
-               FROM Customer c
-               LEFT JOIN Vehicle v ON c.CustomerID = v.CustomerID"""
+               FROM Customers c
+               LEFT JOIN Vehicles v ON c.CustomerID = v.CustomerID"""
         ).fetchall()
-
-        queue = conn.execute("SELECT * FROM command_queue WHERE status='pending'").fetchall()
 
         return {
             "sessions":  sessions_list,
             "customers": [dict(c) for c in raw_customers],
-            "queue":     [dict(q) for q in queue],
             "rate":      RATE_PER_HR
         }
     finally:
@@ -906,12 +831,12 @@ def admin_add_customer(body: AdminAddCustomerBody):
     try:
         conn.execute("BEGIN IMMEDIATE;")
         cursor = conn.execute(
-            "INSERT INTO Customer (Name, Phone, Email, Password) VALUES (?,?,?,?)",
+            "INSERT INTO Customers (Name, Phone, Email, Password) VALUES (?,?,?,?)",
             (body.name, body.phone, f"{body.plate_no}@garage.local", body.pin)
         )
         customer_id = cursor.lastrowid
         conn.execute(
-            "INSERT INTO Vehicle (CustomerID, PlateNo) VALUES (?,?)",
+            "INSERT INTO Vehicles (CustomerID, PlateNo) VALUES (?,?)",
             (customer_id, body.plate_no.upper())
         )
         conn.commit()
@@ -932,10 +857,10 @@ def admin_delete_customer(plate_no: str):
     try:
         conn.execute("BEGIN IMMEDIATE;")
         vehicle = conn.execute(
-            "SELECT CustomerID FROM Vehicle WHERE PlateNo=?", (plate_no.upper(),)
+            "SELECT CustomerID FROM Vehicles WHERE PlateNo=?", (plate_no.upper(),)
         ).fetchone()
         if vehicle:
-            conn.execute("DELETE FROM Customer WHERE CustomerID=?", (vehicle["CustomerID"],))
+            conn.execute("DELETE FROM Customers WHERE CustomerID=?", (vehicle["CustomerID"],))
             conn.commit()
         return {"status": "ok"}
     except Exception as e:
